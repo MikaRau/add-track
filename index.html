@@ -5,47 +5,52 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>GSX-R · Add Track</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.css">
 <style>
  :root{--accent:#e8531a}
- html,body{margin:0;height:100%;font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee}
- #map{height:calc(100% - 152px)}
- #bar{height:152px;box-sizing:border-box;padding:8px 10px;display:flex;flex-direction:column;gap:7px}
- #hint{font-size:13px;color:#bbb;line-height:1.25}
+ *{box-sizing:border-box}
+ html,body{margin:0;height:100%}
+ /* Flex column: search + bar size to content, map fills the rest — so the
+    whole UI is visible on any screen size. 100dvh tracks mobile chrome. */
+ body{display:flex;flex-direction:column;height:100dvh;
+   font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee}
+ #top{flex:0 0 auto;padding:8px 10px;border-bottom:1px solid #222}
+ #search{width:100%;padding:11px 12px;font-size:16px;border-radius:8px;
+   border:1px solid #444;background:#1c1c1c;color:#fff}
+ #map{flex:1 1 auto;min-height:0}
+ #bar{flex:0 0 auto;padding:8px 10px;display:flex;flex-direction:column;gap:7px}
+ #hint{font-size:12.5px;color:#bbb;line-height:1.25}
  #row1{display:flex;gap:8px;align-items:center}
- #name{flex:1;min-width:0;padding:12px;font-size:16px;border-radius:8px;border:1px solid #444;
-   background:#1c1c1c;color:#fff}
- button{padding:12px 14px;font-size:16px;border:0;border-radius:8px;background:#333;color:#fff}
+ #name{flex:1;min-width:0;padding:11px;font-size:16px;border-radius:8px;
+   border:1px solid #444;background:#1c1c1c;color:#fff}
+ button{padding:11px 14px;font-size:16px;border:0;border-radius:8px;background:#333;color:#fff}
  #send{background:var(--accent);font-weight:600;flex:1}
  button:disabled{opacity:.4}
  #len{font-size:13px;color:#bbb;white-space:nowrap;min-width:48px;text-align:right}
  #status{font-size:13px;min-height:18px;color:#9cf}
  #status.err{color:#f88}#status.ok{color:#8f8}
- /* on-map line-length label */
  .len-label{background:var(--accent);color:#fff;border:0;font-weight:700;font-size:13px;
    padding:2px 7px;border-radius:5px;box-shadow:0 1px 4px #0008}
  .len-label:before{display:none}
- /* widen the geocoder search box for phones */
- .leaflet-control-geocoder{border-radius:8px}
- .leaflet-control-geocoder-form input,
- .leaflet-control-geocoder-expanded input{width:62vw;max-width:300px;font-size:15px}
 </style>
 </head>
 <body>
+<div id="top">
+ <input id="search" type="search" enterkeyhint="search" autocomplete="off"
+   placeholder="Search place or address, then Enter…">
+</div>
 <div id="map"></div>
 <div id="bar">
- <div id="hint">Search a place, tap the two ends of the start/finish line, then <b>drag the pins</b>
-  to fine-tune. Keep this page on cellular data — it works while Android Auto runs.</div>
+ <div id="hint">Tap the two ends of the start/finish line, then <b>drag the pins</b> to fine-tune.
+  Keep this page on cellular data — it works while Android Auto runs.</div>
  <div id="row1">
-  <input id="name" placeholder="Track name" autocomplete="off">
+  <input id="name" type="text" enterkeyhint="done" autocomplete="off" placeholder="Track name">
   <span id="len">—</span>
-  <button id="undo">Undo</button>
+  <button id="undo" type="button">Undo</button>
  </div>
- <button id="send" disabled>Send to dash</button>
+ <button id="send" type="button" disabled>Send to dash</button>
  <div id="status"></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script src="https://unpkg.com/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.js"></script>
 <script>
 // Must match TRACK_SVC_UUID / TRACK_CHRC_UUID in aa_bt_all.py on the dash.
 const SVC  = '6e7a0001-b5a3-4f2c-9d8e-1a2b3c4d5e6f';
@@ -58,11 +63,31 @@ const map = L.map('map').setView([61.0, 24.5], 13);
 L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
   { maxZoom: 21, attribution: 'Esri' }).addTo(map);
 
-// Address / place search (free OSM Nominatim). Flies to the result; drops no marker
-// so it never gets confused with the two line-endpoint pins.
-L.Control.geocoder({ collapsed: false, placeholder: 'Search place or address…', defaultMarkGeocode: false })
-  .on('markgeocode', e => { map.fitBounds(e.geocode.bbox); })
-  .addTo(map);
+// Address / place search — own input so Enter always searches (the phone
+// keyboard was treating the old geocoder's Enter as "next field"). Hits
+// OSM Nominatim directly and flies to the first match.
+$('search').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const q = $('search').value.trim();
+  if (!q) return;
+  setStatus('Searching “' + q + '”…');
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q='
+      + encodeURIComponent(q), { headers: { 'Accept': 'application/json' } });
+    const j = await r.json();
+    if (!j || !j.length){ setStatus('No match for “' + q + '”.', 'err'); return; }
+    const it = j[0];
+    if (it.boundingbox){
+      const b = it.boundingbox.map(Number);          // [south, north, west, east]
+      map.fitBounds([[b[0], b[2]], [b[1], b[3]]]);
+    } else {
+      map.setView([parseFloat(it.lat), parseFloat(it.lon)], 16);
+    }
+    setStatus('');
+    $('search').blur();
+  } catch (err){ setStatus('Search failed: ' + (err.message || err), 'err'); }
+});
 
 // Best-effort centre on the rider (works at the track; harmless elsewhere).
 if (navigator.geolocation) navigator.geolocation.getCurrentPosition(
