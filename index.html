@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>GSX-R · Add Track</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.css">
+<style>
+ :root{--accent:#e8531a}
+ html,body{margin:0;height:100%;font-family:system-ui,-apple-system,sans-serif;background:#111;color:#eee}
+ #map{height:calc(100% - 152px)}
+ #bar{height:152px;box-sizing:border-box;padding:8px 10px;display:flex;flex-direction:column;gap:7px}
+ #hint{font-size:13px;color:#bbb;line-height:1.25}
+ #row1{display:flex;gap:8px;align-items:center}
+ #name{flex:1;min-width:0;padding:12px;font-size:16px;border-radius:8px;border:1px solid #444;
+   background:#1c1c1c;color:#fff}
+ button{padding:12px 14px;font-size:16px;border:0;border-radius:8px;background:#333;color:#fff}
+ #send{background:var(--accent);font-weight:600;flex:1}
+ button:disabled{opacity:.4}
+ #len{font-size:13px;color:#bbb;white-space:nowrap;min-width:48px;text-align:right}
+ #status{font-size:13px;min-height:18px;color:#9cf}
+ #status.err{color:#f88}#status.ok{color:#8f8}
+ /* on-map line-length label */
+ .len-label{background:var(--accent);color:#fff;border:0;font-weight:700;font-size:13px;
+   padding:2px 7px;border-radius:5px;box-shadow:0 1px 4px #0008}
+ .len-label:before{display:none}
+ /* widen the geocoder search box for phones */
+ .leaflet-control-geocoder{border-radius:8px}
+ .leaflet-control-geocoder-form input,
+ .leaflet-control-geocoder-expanded input{width:62vw;max-width:300px;font-size:15px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="bar">
+ <div id="hint">Search a place, tap the two ends of the start/finish line, then <b>drag the pins</b>
+  to fine-tune. Keep this page on cellular data — it works while Android Auto runs.</div>
+ <div id="row1">
+  <input id="name" placeholder="Track name" autocomplete="off">
+  <span id="len">—</span>
+  <button id="undo">Undo</button>
+ </div>
+ <button id="send" disabled>Send to dash</button>
+ <div id="status"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-control-geocoder@2.4.0/dist/Control.Geocoder.js"></script>
+<script>
+// Must match TRACK_SVC_UUID / TRACK_CHRC_UUID in aa_bt_all.py on the dash.
+const SVC  = '6e7a0001-b5a3-4f2c-9d8e-1a2b3c4d5e6f';
+const CHRC = '6e7a0002-b5a3-4f2c-9d8e-1a2b3c4d5e6f';
+const MIN_M = 3, MAX_M = 300;
+const $ = id => document.getElementById(id);
+function setStatus(msg, cls){ const s=$('status'); s.textContent=msg; s.className=cls||''; }
+
+const map = L.map('map').setView([61.0, 24.5], 13);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom: 21, attribution: 'Esri' }).addTo(map);
+
+// Address / place search (free OSM Nominatim). Flies to the result; drops no marker
+// so it never gets confused with the two line-endpoint pins.
+L.Control.geocoder({ collapsed: false, placeholder: 'Search place or address…', defaultMarkGeocode: false })
+  .on('markgeocode', e => { map.fitBounds(e.geocode.bbox); })
+  .addTo(map);
+
+// Best-effort centre on the rider (works at the track; harmless elsewhere).
+if (navigator.geolocation) navigator.geolocation.getCurrentPosition(
+  p => map.setView([p.coords.latitude, p.coords.longitude], 18), () => {},
+  { enableHighAccuracy: true, timeout: 8000 });
+
+let mk = [], line = null;
+function distM(a, b){
+  const r = 6371000, rad = Math.PI/180;
+  const dLa = (b[0]-a[0])*rad, dLo = (b[1]-a[1])*rad;
+  const h = Math.sin(dLa/2)**2 + Math.cos(a[0]*rad)*Math.cos(b[0]*rad)*Math.sin(dLo/2)**2;
+  return 2*r*Math.asin(Math.sqrt(h));
+}
+function points(){ return mk.map(m => { const p = m.getLatLng(); return [p.lat, p.lng]; }); }
+function redraw(){
+  const pts = points();
+  if (line){ map.removeLayer(line); line = null; }
+  if (pts.length === 2){
+    const len = distM(pts[0], pts[1]);
+    line = L.polyline(pts, { color: '#e8531a', weight: 5 }).addTo(map);
+    line.bindTooltip(len.toFixed(0) + ' m',
+      { permanent: true, direction: 'center', className: 'len-label' }).openTooltip();
+    $('len').textContent = len.toFixed(0) + ' m';
+  } else $('len').textContent = '—';
+  $('send').disabled = pts.length !== 2;
+}
+// Tap to drop a pin (max 2); each pin is draggable and updates the line live.
+function addPin(latlng){
+  const m = L.marker(latlng, { draggable: true, autoPan: true }).addTo(map);
+  m.on('drag', redraw);
+  m.on('dragend', redraw);
+  mk.push(m);
+  redraw();
+}
+map.on('click', e => { if (mk.length >= 2) return; addPin(e.latlng); });
+$('undo').onclick = () => { const m = mk.pop(); if (m) map.removeLayer(m); redraw(); };
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function connectWithRetry(dev, tries = 3){
+  let err;
+  for (let i = 0; i < tries; i++){
+    try { return await dev.gatt.connect(); }
+    catch (e){ err = e; setStatus('Connect retry ' + (i+1) + '…'); await sleep(400*(i+1)); }
+  }
+  throw err;
+}
+$('send').onclick = async () => {
+  if (!navigator.bluetooth){ setStatus('Web Bluetooth not available — use Chrome on Android.', 'err'); return; }
+  const name = $('name').value.trim();
+  if (!name){ setStatus('Enter a track name first.', 'err'); return; }
+  const pts = points();
+  if (pts.length !== 2){ setStatus('Place both ends of the line first.', 'err'); return; }
+  const len = distM(pts[0], pts[1]);
+  if (len < MIN_M || len > MAX_M){
+    setStatus('Line is ' + len.toFixed(0) + ' m — draw it across the track (' + MIN_M + '–' + MAX_M + ' m).', 'err');
+    return;
+  }
+  const payload = JSON.stringify({ name, a: { lat: pts[0][0], lon: pts[0][1] }, b: { lat: pts[1][0], lon: pts[1][1] } });
+  let dev;
+  try {
+    setStatus('Choose your dash (OpenAutoLink-…)…');
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: 'OpenAutoLink' }], optionalServices: [SVC] });
+  } catch (e){ setStatus('Cancelled / no device chosen.', 'err'); return; }
+  try {
+    $('send').disabled = true;
+    setStatus('Connecting to ' + dev.name + '…');
+    const gatt = await connectWithRetry(dev);
+    const svc  = await gatt.getPrimaryService(SVC);
+    const ch   = await svc.getCharacteristic(CHRC);
+    setStatus('Sending…');
+    await ch.writeValueWithResponse(new TextEncoder().encode(payload));
+    setStatus('✓ Saved "' + name + '" to the dash.', 'ok');
+    mk.forEach(m => map.removeLayer(m)); mk = []; redraw(); $('name').value = '';
+    setTimeout(() => { try { dev.gatt.disconnect(); } catch (e){} }, 300);
+  } catch (e){
+    setStatus('Failed: ' + (e.message || e) + '  (tap Send again — Android BLE often drops the first attempt)', 'err');
+    try { dev.gatt.disconnect(); } catch (_){}
+    $('send').disabled = false;
+  }
+};
+
+// https:// and file:// are both secure contexts (Web Bluetooth works from a local
+// file in desktop Chrome); plain http is not.
+if (!window.isSecureContext)
+  setStatus('Not a secure context — use HTTPS, or open this file directly (file://) in Chrome.', 'err');
+else if (!navigator.bluetooth)
+  setStatus('No Web Bluetooth here — use desktop Chrome (with Bluetooth) or Chrome on Android.', 'err');
+</script>
+</body>
+</html>
